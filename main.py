@@ -20,3 +20,12 @@ async def transactions(t: Transaction, db: pymysql.Connection = Depends(get_db))
     except:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED)
     return t
+
+
+'''
+もうちょっと時間があったら直したかったこと
+・Docker周りの整備
+・repository層がちょっと適当
+・SQLAlchemyとかもやりたかった
+・金額上限超過時のエラーハンドリングが適当
+'''
