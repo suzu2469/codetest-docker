@@ -1,5 +1,7 @@
-from fastapi import FastAPI
+import pymysql
+from fastapi import FastAPI, Depends
 
+from dependency import get_db
 from transaction import Transaction
 
 app = FastAPI()
@@ -11,5 +13,5 @@ async def root():
 
 
 @app.post("/transactions")
-async def transactions(t: Transaction):
+async def transactions(t: Transaction, db: pymysql.Connection = Depends(get_db)):
     return t
