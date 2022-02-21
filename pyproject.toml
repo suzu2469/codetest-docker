@@ -8,6 +8,7 @@ authors = ["shohei0203 <umegiwa@gmail.com>"]
 python = "^3.9"
 fastapi = "^0.74.0"
 uvicorn = {extras = ["standard"], version = "^0.17.5"}
+PyMySQL = "^1.0.2"
 
 [tool.poetry.dev-dependencies]
 
