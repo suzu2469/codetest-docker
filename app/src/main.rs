@@ -1,5 +1,5 @@
-use std::{fmt, io, time};
-use std::fmt::Formatter;
+use std::{fmt};
+use std::borrow::Cow;
 use std::thread;
 use axum::{routing::post, Router, Extension, Json, BoxError, body};
 use std::net::SocketAddr;
@@ -8,19 +8,19 @@ use anyhow::Result;
 use axum::extract::{FromRequest, RequestParts};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
-use sqlx::{MySql, Pool, Row, Transaction};
+use sqlx::mysql::{MySqlPoolOptions};
+use sqlx::{MySql, Pool, Transaction};
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use validator::{Validate};
 use thiserror::{Error};
 use async_trait::async_trait;
-use axum::body::HttpBody;
-use sqlx::types::{BigDecimal};
 use num_traits::{ToPrimitive};
 
+// layerd + DI にもできるが1エンドポイントのためベタ実装する
 #[tokio::main]
 async fn main() -> Result<()> {
+    // DBプール生成
     let pool = MySqlPoolOptions::new()
         .max_connections(5)
         .connect("mysql://root@localhost:3306/codetest")
@@ -29,18 +29,41 @@ async fn main() -> Result<()> {
     // database から構文エラーが返ってくる
     // sqlx::query_file!("../db/init.sql").run(&pool).await?;
 
+    // ルーター作成
     let app = Router::new()
         .route("/transactions", post(handler))
         .layer(Extension(pool));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8888));
+    // アプリケーション作成とServe
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
+
     Ok(())
 }
 
+// Tをバリデーション済みの型
+// axum の Handler を通る必要がある
 struct ValidatedRequest<T>(T);
+
+// JSONリクエストBody -> バリデーション
+#[async_trait]
+impl<T, B> FromRequest<B> for ValidatedRequest<T>
+    where
+        T: DeserializeOwned + Validate,
+        B: Send + body::HttpBody,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: &mut RequestParts<B>) -> std::result::Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req).await?;
+        value.validate()?;
+        Ok(ValidatedRequest(value))
+    }
+}
 
 // エラー種別
 #[derive(Debug, Error)]
@@ -55,11 +78,34 @@ enum AppError {
     DomainSpecification(#[from] DomainSpecificaionError),
 }
 
+// ドメイン仕様エラー
+// Application層でドメインそのもののエラーとして扱う
 #[derive(Debug, Error)]
 enum DomainSpecificaionError {
     #[error("user {0} has over amount at 1000")]
     UserHasOverAmount(i32),
 }
+
+// ライブラリ側に実装がないので作る
+enum MySqlErrorCode {
+    Unknown,
+    DeadlockFound,
+}
+
+// &str -> MySqlErrorCode
+impl<'a> From<Cow<'a, str>> for MySqlErrorCode {
+    fn from(str: Cow<'a, str>) -> Self {
+        match str.as_ref() {
+            "40001" => {
+                MySqlErrorCode::DeadlockFound
+            }
+            _ => {
+                MySqlErrorCode::Unknown
+            }
+        }
+    }
+}
+
 
 // エラー -> レスポンス実装
 impl IntoResponse for AppError {
@@ -81,27 +127,9 @@ impl IntoResponse for AppError {
     }
 }
 
-// JSONリクエストBody -> バリデーション
-#[async_trait]
-impl<T, B> FromRequest<B> for ValidatedRequest<T>
-    where
-        T: DeserializeOwned + Validate,
-        B: Send + body::HttpBody,
-        B::Data: Send,
-        B::Error: Into<BoxError>,
-{
-    type Rejection = AppError;
-
-    async fn from_request(req: &mut RequestParts<B>) -> std::result::Result<Self, Self::Rejection> {
-        let Json(value) = Json::<T>::from_request(req).await?;
-        value.validate()?;
-        Ok(ValidatedRequest(value))
-    }
-}
-
-#[derive(Debug, Deserialize, Validate)]
+// POST /transactions HTTPBody
+#[derive(Deserialize, Validate)]
 struct TransactionRequestBody {
-    id: i32,
     user_id: i32,
     #[validate(range(min = 1, max = 1000))]
     amount: i32,
@@ -115,23 +143,40 @@ impl std::fmt::Display for TransactionRequestBody {
     }
 }
 
+// レスポンス汎用型
+// exp. Ok(StatusCode.OK, Json(JSONResponseBody))
 #[derive(Debug, Serialize)]
 struct JSONResponseBody {
     message: String,
 }
 
+// POST /transactions Handler
 async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(payload): ValidatedRequest<TransactionRequestBody>) -> Result<impl IntoResponse, AppError> {
     println!("Requested /transactions, body: {}", payload);
 
+    // トランザクション復帰遅延 ms
+    let tx_retry_duration = Duration::from_millis(100);
+
+    // トランザクションエラーから復帰のため loop で処理を行う
     loop {
+        // トランザクション開始
         let mut tx: Transaction<MySql> = pool.begin().await?;
-        let res = sqlx::query!("SELECT SUM(amount) as sum, COUNT(user_id) as count FROM transactions WHERE user_id = ? FOR UPDATE", payload.user_id)
+        // user_id=payload.user_id の現在のamount合計を取得する
+        // マクロの型推論に任せる Result<?, sqlx::Error>
+        let res = sqlx::query!("SELECT SUM(amount) as sum FROM transactions WHERE user_id = ? FOR UPDATE", payload.user_id)
             .fetch_one(&mut tx).await;
+
         match res {
+            // amount取得正常終了
             Ok(row) => {
+                // sum: Option<BigDecimal>
+                // BigDecimalは扱いづらく、アプリケーションの使用上MAX1000までにしかならないためi64に変換する
                 let current_amount = row.sum.unwrap_or_default().to_i64().unwrap_or_default();
+                // 現在の合計値 + リクエストのamount
                 match current_amount + payload.amount as i64 {
+                    // 0~1000まで
                     0..=1000 => {
+                        // INSERT クエリ実行
                         let insert_res = sqlx::query!(
                             "INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)",
                             payload.user_id,
@@ -141,32 +186,66 @@ async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(p
                             .execute(&mut tx)
                             .await;
                         match insert_res {
+                            // クエリ完了
                             Ok(_) => {
                                 tx.commit().await?;
                                 break Ok((StatusCode::OK, Json(JSONResponseBody { message: "Transaction created".to_string() })));
                             }
+                            // DBエラーが出た場合
                             Err(sqlx::Error::Database(db_error)) => {
-                                thread::sleep(Duration::from_millis(200));
-                                tx.rollback().await?;
-                                continue;
+                                match db_error.code().map(MySqlErrorCode::from).unwrap_or(MySqlErrorCode::Unknown) {
+                                    // Deadlockエラーが出た時は
+                                    MySqlErrorCode::DeadlockFound => {
+                                        // 遅延
+                                        thread::sleep(tx_retry_duration);
+                                        // ロールバック
+                                        tx.rollback().await?;
+                                        // 続行
+                                        continue;
+                                    }
+                                    // 謎のエラーが出た時は終了
+                                    MySqlErrorCode::Unknown => {
+                                        break Err(AppError::DBConnection(sqlx::Error::Database(db_error)));
+                                    }
+                                }
                             }
+                            // その他のエラーが出た時は終了
                             Err(e) => {
                                 tx.rollback().await?;
                                 break Err(AppError::DBConnection(e));
                             }
                         }
                     }
+                    // 1001以上
                     _ => {
                         tx.rollback().await?;
                         break Err(AppError::DomainSpecification(DomainSpecificaionError::UserHasOverAmount(current_amount as i32)));
                     }
                 }
             }
+            // DBエラーが出た場合
             Err(sqlx::Error::Database(db_error)) => {
-                thread::sleep(Duration::from_millis(200));
-                tx.rollback().await?;
-                continue;
+                match db_error.
+                    code()
+                    .map(MySqlErrorCode::from)
+                    .unwrap_or(MySqlErrorCode::Unknown)
+                {
+                    // Deadlockが発生した時
+                    MySqlErrorCode::DeadlockFound => {
+                        // 遅延して
+                        thread::sleep(tx_retry_duration);
+                        // ロールバック
+                        tx.rollback().await?;
+                        // ループ続行
+                        continue;
+                    }
+                    // 謎のエラーが出た時は終了
+                    MySqlErrorCode::Unknown => {
+                        break Err(AppError::DBConnection(sqlx::Error::Database(db_error)));
+                    }
+                }
             }
+            // その他のエラーが出た時は終了
             Err(e) => {
                 tx.rollback().await?;
                 break Err(AppError::DBConnection(e));
