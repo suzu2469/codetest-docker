@@ -1,12 +1,14 @@
-use std::fmt;
+use std::{fmt, io, time};
 use std::fmt::Formatter;
+use std::thread;
 use axum::{routing::post, Router, Extension, Json, BoxError, body};
 use std::net::SocketAddr;
+use std::time::Duration;
 use anyhow::Result;
 use axum::extract::{FromRequest, RequestParts};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use sqlx::mysql::MySqlPoolOptions;
+use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::{MySql, Pool, Row, Transaction};
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
@@ -14,7 +16,7 @@ use validator::{Validate};
 use thiserror::{Error};
 use async_trait::async_trait;
 use axum::body::HttpBody;
-use sqlx::types::BigDecimal;
+use sqlx::types::{BigDecimal};
 use num_traits::{ToPrimitive};
 
 #[tokio::main]
@@ -101,7 +103,7 @@ impl<T, B> FromRequest<B> for ValidatedRequest<T>
 struct TransactionRequestBody {
     id: i32,
     user_id: i32,
-    #[validate(range(min = 0, max = 1000))]
+    #[validate(range(min = 1, max = 1000))]
     amount: i32,
     description: String,
 }
@@ -121,28 +123,54 @@ struct JSONResponseBody {
 async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(payload): ValidatedRequest<TransactionRequestBody>) -> Result<impl IntoResponse, AppError> {
     println!("Requested /transactions, body: {}", payload);
 
-    let mut tx: Transaction<MySql> = pool.begin().await?;
-
-    let row: (Option<BigDecimal>, ) = sqlx::query_as("SELECT SUM(amount) as sum FROM transactions WHERE user_id = ? FOR UPDATE")
-        .bind(payload.user_id)
-        .fetch_one(&mut tx)
-        .await?;
-    let sum = row.0.unwrap_or_default().to_i64().unwrap_or_default();
-
-    match sum + payload.amount as i64 {
-        0..=1000 => {
-            sqlx::query("INSERT INTO transactions (user_id, amount, description) values (?, ? ,?)")
-                .bind(payload.user_id)
-                .bind(payload.amount)
-                .bind(payload.description)
-                .execute(&mut tx).
-                await?;
-            tx.commit().await?;
-            Ok((StatusCode::OK, Json(JSONResponseBody { message: "Transaction created".to_string() })))
-        }
-        _ => {
-            tx.rollback().await?;
-            Err(AppError::DomainSpecification(DomainSpecificaionError::UserHasOverAmount(payload.user_id)))
+    loop {
+        let mut tx: Transaction<MySql> = pool.begin().await?;
+        let res = sqlx::query!("SELECT SUM(amount) as sum, COUNT(user_id) as count FROM transactions WHERE user_id = ? FOR UPDATE", payload.user_id)
+            .fetch_one(&mut tx).await;
+        match res {
+            Ok(row) => {
+                let current_amount = row.sum.unwrap_or_default().to_i64().unwrap_or_default();
+                match current_amount + payload.amount as i64 {
+                    0..=1000 => {
+                        let insert_res = sqlx::query!(
+                            "INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)",
+                            payload.user_id,
+                            payload.amount,
+                            payload.description,
+                        )
+                            .execute(&mut tx)
+                            .await;
+                        match insert_res {
+                            Ok(_) => {
+                                tx.commit().await?;
+                                break Ok((StatusCode::OK, Json(JSONResponseBody { message: "Transaction created".to_string() })));
+                            }
+                            Err(sqlx::Error::Database(db_error)) => {
+                                thread::sleep(Duration::from_millis(200));
+                                tx.rollback().await?;
+                                continue;
+                            }
+                            Err(e) => {
+                                tx.rollback().await?;
+                                break Err(AppError::DBConnection(e));
+                            }
+                        }
+                    }
+                    _ => {
+                        tx.rollback().await?;
+                        break Err(AppError::DomainSpecification(DomainSpecificaionError::UserHasOverAmount(current_amount as i32)));
+                    }
+                }
+            }
+            Err(sqlx::Error::Database(db_error)) => {
+                thread::sleep(Duration::from_millis(200));
+                tx.rollback().await?;
+                continue;
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                break Err(AppError::DBConnection(e));
+            }
         }
     }
 }
