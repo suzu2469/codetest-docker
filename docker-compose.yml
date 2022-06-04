@@ -10,9 +10,5 @@ services:
     ports:
       - 3306:3306
     hostname: db
+    platform: linux/amd64
 
-  app:
-    build:
-      context: app
-    ports:
-      - 8888:8888
