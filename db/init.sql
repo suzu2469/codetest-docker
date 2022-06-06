@@ -1,3 +1,7 @@
+create database if not exists codetest character set utf8mb4 collate utf8mb4_bin;
+
+use codetest;
+
 drop table if exists users;
 create table if not exists users
 (

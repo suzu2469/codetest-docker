@@ -16,14 +16,15 @@ use validator::{Validate};
 use thiserror::{Error};
 use async_trait::async_trait;
 use num_traits::{ToPrimitive};
+use sqlx::types::BigDecimal;
 
-// layerd + DI にもできるが1エンドポイントのためベタ実装する
 #[tokio::main]
 async fn main() -> Result<()> {
+    let db_host = std::env::var("DB_HOST")?;
     // DBプール生成
     let pool = MySqlPoolOptions::new()
         .max_connections(5)
-        .connect("mysql://root@localhost:3306/codetest")
+        .connect(format!("mysql://root@{}:3306/codetest", db_host).as_str())
         .await?;
 
     // database から構文エラーが返ってくる
@@ -155,21 +156,24 @@ async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(p
     println!("Requested /transactions, body: {}", payload);
 
     // トランザクション復帰遅延 ms
-    let tx_retry_duration = Duration::from_millis(100);
+    let tx_retry_duration = Duration::from_millis(50);
 
     // トランザクションエラーから復帰のため loop で処理を行う
     loop {
         // トランザクション開始
         let mut tx: Transaction<MySql> = pool.begin().await?;
         // user_id=payload.user_id の現在のamount合計を取得する
-        // マクロの型推論に任せる Result<?, sqlx::Error>
-        let res = sqlx::query!("SELECT SUM(amount) as sum FROM transactions WHERE user_id = ? FOR UPDATE", payload.user_id)
+        #[derive(sqlx::FromRow)]
+        struct SumQueryResult {
+            sum: Option<BigDecimal>,
+        }
+        let res = sqlx::query_as::<_, SumQueryResult>("SELECT SUM(amount) as sum FROM transactions WHERE user_id = ? FOR UPDATE")
+            .bind(payload.user_id)
             .fetch_one(&mut tx).await;
 
         match res {
             // amount取得正常終了
             Ok(row) => {
-                // sum: Option<BigDecimal>
                 // BigDecimalは扱いづらく、アプリケーションの使用上MAX1000までにしかならないためi64に変換する
                 let current_amount = row.sum.unwrap_or_default().to_i64().unwrap_or_default();
                 // 現在の合計値 + リクエストのamount
@@ -177,12 +181,12 @@ async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(p
                     // 0~1000まで
                     0..=1000 => {
                         // INSERT クエリ実行
-                        let insert_res = sqlx::query!(
-                            "INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)",
-                            payload.user_id,
-                            payload.amount,
-                            payload.description,
+                        let insert_res = sqlx::query(
+                            "INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)"
                         )
+                            .bind(payload.user_id)
+                            .bind(payload.amount)
+                            .bind(payload.description.clone())
                             .execute(&mut tx)
                             .await;
                         match insert_res {
@@ -219,7 +223,7 @@ async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(p
                     // 1001以上
                     _ => {
                         tx.rollback().await?;
-                        break Err(AppError::DomainSpecification(DomainSpecificaionError::UserHasOverAmount(current_amount as i32)));
+                        break Err(AppError::DomainSpecification(DomainSpecificaionError::UserHasOverAmount(payload.user_id)));
                     }
                 }
             }

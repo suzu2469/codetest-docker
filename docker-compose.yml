@@ -12,3 +12,12 @@ services:
     hostname: db
     platform: linux/amd64
 
+  app:
+    build: ./app
+    ports:
+      - 8888:8888
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+
