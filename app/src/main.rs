@@ -20,7 +20,7 @@ use sqlx::types::BigDecimal;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db_host = std::env::var("DB_HOST")?;
+    let db_host = std::env::var("DB_HOST").unwrap_or("localhost".to_string());
     // DBプール生成
     let pool = MySqlPoolOptions::new()
         .max_connections(5)
@@ -121,9 +121,8 @@ impl IntoResponse for AppError {
                 let msg = format!("Database error: {}", self.to_string());
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(JSONResponseBody { message: msg }))
             }
-            AppError::DomainSpecification(_) => {
-                (StatusCode::BAD_REQUEST, Json(JSONResponseBody { message: self.to_string() }))
-            }
+            AppError::DomainSpecification(_) =>
+                (StatusCode::PAYMENT_REQUIRED, Json(JSONResponseBody { message: self.to_string() }))
         }.into_response()
     }
 }
@@ -193,7 +192,7 @@ async fn handler(Extension(ref pool): Extension<Pool<MySql>>, ValidatedRequest(p
                             // クエリ完了
                             Ok(_) => {
                                 tx.commit().await?;
-                                break Ok((StatusCode::OK, Json(JSONResponseBody { message: "Transaction created".to_string() })));
+                                break Ok((StatusCode::CREATED, Json(JSONResponseBody { message: "Transaction created".to_string() })));
                             }
                             // DBエラーが出た場合
                             Err(sqlx::Error::Database(db_error)) => {
